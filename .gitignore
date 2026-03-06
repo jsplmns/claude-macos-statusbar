@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+.claude_tracker.json
+.claude_tracker_debug.txt
+.claude_tracker_crash.log

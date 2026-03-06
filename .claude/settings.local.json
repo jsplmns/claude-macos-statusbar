@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"import ast, sys; ast.parse\\(open\\(''/Users/jonathanskudlik/code/claude-macos-statusbar/claude_tracker.py''\\).read\\(\\)\\); print\\(''✓ syntax OK''\\)\")",
+      "Bash(python3 -c \"import ast; ast.parse\\(open\\(''/Users/jonathanskudlik/code/claude-macos-statusbar/claude_tracker.py''\\).read\\(\\)\\); print\\(''✓ syntax OK''\\)\")"
+    ]
+  }
+}
