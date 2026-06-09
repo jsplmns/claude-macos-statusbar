@@ -20,17 +20,21 @@ A lightweight macOS menu bar app that shows your Claude.ai usage at a glance —
 
 ## Quick install (one command)
 
-If you already have **Python 3.10+** installed, just paste this into the **Terminal**
-app (`⌘ + Space`, type *Terminal*, press Return) and hit Return:
+Paste this into the **Terminal** app (`⌘ + Space`, type *Terminal*, press Return),
+hit Return, and follow any prompts:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/jsplmns/claude-macos-statusbar/main/install_claude_tracker.sh | bash
 ```
 
-It downloads the app, sets it up, and starts it — a gauge icon appears in your menu bar.
+It does everything for you — it even **installs Python automatically** if you don't
+have it (macOS will ask for your login password for that one step), then downloads the
+app and starts it. A gauge icon appears in your menu bar.
+
 Then jump to **[Step 4 — Connect your Claude account](#step-4--connect-your-claude-account)**.
 
-Don't have Python yet? Follow the step-by-step guide below instead.
+> Prefer to do it by hand, or curious what each step does? The step-by-step guide below
+> walks through the same thing manually.
 
 ---
 

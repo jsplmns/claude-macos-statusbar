@@ -402,15 +402,31 @@ def _pct_and_cd(cfg: dict) -> tuple[float, str | None]:
 # ── Claude.ai API helpers ──────────────────────────────────────────────────────
 
 _HEADERS = {
-    "Accept":       "application/json",
-    "Content-Type": "application/json",
-    "User-Agent":   (
+    "Accept":          "application/json",
+    "Content-Type":    "application/json",
+    "User-Agent":      (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
-    "Referer": "https://claude.ai/",
+    "Referer":         "https://claude.ai/",
+    # Look like the real claude.ai web app to reduce Cloudflare friction on
+    # machines that haven't warmed up a browser session. (No Accept-Encoding —
+    # http.client won't auto-decompress gzip and JSON parsing would fail.)
+    "Origin":          "https://claude.ai",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Sec-Fetch-Site":  "same-origin",
+    "Sec-Fetch-Mode":  "cors",
+    "Sec-Fetch-Dest":  "empty",
 }
+
+
+def _looks_like_cloudflare(raw: str | None) -> bool:
+    r = (raw or "").lower()
+    return any(s in r for s in (
+        "just a moment", "cf-browser-verification", "cf-chl", "/cdn-cgi/",
+        "attention required", "enable javascript and cookies",
+    ))
 
 
 def _conn(session_key: str) -> tuple[http.client.HTTPSConnection, dict]:
@@ -681,15 +697,32 @@ def _parse_usage_headers(resp) -> dict | None:
 
 
 def validate_session_key(session_key: str) -> tuple[bool, str, str]:
-    status, body, _, _ = _get(session_key, "/api/organizations")
-    if status == 200 and isinstance(body, list) and body:
-        org    = _select_org(body) or body[0]
-        org_id = org.get("uuid") or org.get("id") or ""
-        name   = org.get("name", "your account")
-        return True, org_id, f"Connected to {name}"
+    status, body, _, raw = _get(session_key, "/api/organizations")
+
+    if status == 200 and isinstance(body, list):
+        if body:
+            org    = _select_org(body) or body[0]
+            org_id = org.get("uuid") or org.get("id") or ""
+            name   = org.get("name", "your account")
+            return True, org_id, f"Connected to {name}"
+        return False, "", "Connected, but no Claude workspace was found for this account."
+
+    if status == 0:
+        return False, "", ("Couldn't reach claude.ai. Check your internet connection, "
+                           "then click Connect and try again.")
+
+    if _looks_like_cloudflare(raw):
+        return False, "", ("claude.ai is temporarily blocking automated requests from "
+                           "this Mac (Cloudflare). Open claude.ai in your browser, wait "
+                           "a moment, then try Connect again.")
+
     if status in (401, 403):
-        return False, "", "Session key rejected — expired or invalid"
-    return False, "", f"Unexpected response (HTTP {status})"
+        return False, "", ("That session key wasn't accepted. In your browser at "
+                           "claude.ai, copy the full value of the sessionKey cookie "
+                           "(it starts with sk-ant-sid…) and paste it again.")
+
+    return False, "", (f"Unexpected response from claude.ai (HTTP {status}). "
+                       "Please try again in a moment.")
 
 
 # ── App ────────────────────────────────────────────────────────────────────────
@@ -1058,44 +1091,60 @@ class ClaudeTracker(rumps.App):
             return (resp.text or "").strip() if resp.clicked else None
 
     def connect_claude(self, _) -> None:
-        key = self._prompt_for_key()
-        if not key:
-            return
-
         _icon = str(ICON_PATH) if ICON_PATH.exists() else None
+        try:
+            key = self._prompt_for_key()
+            if not key:
+                return
 
-        ok, org_id, message = validate_session_key(key)
-        if not ok:
-            rumps.alert(title="Connection failed",
-                        message=f"{message}\n\nPlease check the key and try again.",
+            # A pasted cookie sometimes arrives as `sessionKey=sk-ant-…` or with
+            # surrounding quotes/whitespace — normalize before validating.
+            key = key.strip().strip('"\'').strip()
+            if key.lower().startswith("sessionkey="):
+                key = key.split("=", 1)[1].strip()
+
+            ok, org_id, message = validate_session_key(key)
+            if not ok:
+                rumps.alert(title="Couldn't connect", message=message,
+                            ok="OK", icon_path=_icon)
+                return
+
+            # Confirm it's really you before writing the credential to the Keychain.
+            if not touch_id_confirm(
+                    "Confirm it's you to save your Claude session key securely "
+                    "in your macOS Keychain."):
+                rumps.alert(title="Not saved",
+                            message="Touch ID wasn't confirmed, so your session key "
+                                    "was not saved. You can try connecting again anytime.",
+                            ok="OK", icon_path=_icon)
+                return
+
+            cfg = load_cfg()
+            cfg["session_key"] = key
+            cfg["org_id"]      = org_id
+            cfg["live_mode"]   = True
+            for f in self._IDENTITY_FIELDS:   # re-detect for the freshly connected org
+                cfg[f] = None
+            save_cfg(cfg)
+            self.cfg = cfg
+            self._fetch_error = ""
+            self._do_live_fetch()
+            rumps.alert(title="Connected",
+                        message=f"{message}\n\nYour session key is stored in the macOS "
+                                "Keychain (encrypted) — never in a plain file — and is "
+                                "only ever sent to claude.ai.\n\nUsage syncs every minute.",
                         ok="OK", icon_path=_icon)
-            return
-
-        # Confirm it's really you before writing the credential to the Keychain.
-        if not touch_id_confirm(
-                "Confirm it's you to save your Claude session key securely "
-                "in your macOS Keychain."):
-            rumps.alert(title="Not saved",
-                        message="Touch ID wasn't confirmed, so your session key "
-                                "was not saved. You can try connecting again anytime.",
+        except Exception as e:
+            # Never fail silently — surface the detail so it can be reported.
+            try:
+                (Path.home() / ".claude_tracker_crash.log").write_text(
+                    f"[{datetime.now()}] connect error: {e}\n{traceback.format_exc()}\n")
+            except Exception:
+                pass
+            rumps.alert(title="Couldn't connect",
+                        message=f"Something went wrong while connecting:\n\n{e}\n\n"
+                                "Please try again, or report this message.",
                         ok="OK", icon_path=_icon)
-            return
-
-        cfg = load_cfg()
-        cfg["session_key"] = key
-        cfg["org_id"]      = org_id
-        cfg["live_mode"]   = True
-        for f in self._IDENTITY_FIELDS:    # re-detect for the freshly connected org
-            cfg[f] = None
-        save_cfg(cfg)
-        self.cfg = cfg
-        self._fetch_error = ""
-        self._do_live_fetch()
-        rumps.alert(title="Connected",
-                    message=f"{message}\n\nYour session key is stored in the macOS "
-                            "Keychain (encrypted) — never in a plain file — and is "
-                            "only ever sent to claude.ai.\n\nUsage syncs every minute.",
-                    ok="OK", icon_path=_icon)
 
     # Identity fields cleared on connect (re-detect) and disconnect (privacy).
     _IDENTITY_FIELDS = ("plan", "account_name", "account_email", "org_name",

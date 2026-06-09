@@ -15,6 +15,11 @@ REPO_SLUG="jsplmns/claude-macos-statusbar"
 REPO_BRANCH="main"
 BOOTSTRAP_DIR="$HOME/.claude-statusbar"    # stable home for the curl|bash case
 
+# Official python.org installer used if no suitable Python is found.
+PYTHON_PKG_VERSION="3.12.8"
+PYTHON_PKG_MM="3.12"                        # framework version dir / app folder
+PYTHON_PKG_URL="https://www.python.org/ftp/python/${PYTHON_PKG_VERSION}/python-${PYTHON_PKG_VERSION}-macos11.pkg"
+
 echo ""
 echo "╔══════════════════════════════════════════════╗"
 echo "║   Claude AI Usage Tracker – Installer        ║"
@@ -67,8 +72,8 @@ find_base_python() {
     )
     for PY in "${CANDIDATES[@]}"; do
         command -v "$PY" &>/dev/null 2>&1 || continue
-        # Must be 3.8+
-        VER=$("$PY" -c "import sys; print(sys.version_info >= (3,8))" 2>/dev/null || echo False)
+        # Must be 3.10+ (the app uses modern syntax; Apple's bundled 3.9 is skipped)
+        VER=$("$PY" -c "import sys; print(sys.version_info >= (3,10))" 2>/dev/null || echo False)
         [ "$VER" = "True" ] || continue
         # Must be a framework build (AppKit requirement)
         FW=$("$PY" -c "import sysconfig; print(bool(sysconfig.get_config_var('PYTHONFRAMEWORK')))" 2>/dev/null || echo False)
@@ -78,22 +83,38 @@ find_base_python() {
     return 1
 }
 
-echo "🔍  Looking for a compatible (framework) Python 3..."
+echo "🔍  Looking for a compatible (framework) Python 3.10+ ..."
 BASE_PYTHON=$(find_base_python || true)
 
 if [ -z "$BASE_PYTHON" ]; then
     echo ""
-    echo "❌  No framework Python found on this machine."
+    echo "🐍  No suitable Python found — installing the official Python ${PYTHON_PKG_VERSION}"
+    echo "    from python.org. macOS will ask for your login password to install it."
     echo ""
-    echo "   rumps needs a 'framework' Python to draw macOS menu bar icons."
-    echo "   Homebrew Python qualifies — make sure it is installed:"
-    echo ""
-    echo "   brew install python3"
-    echo ""
-    echo "   Or grab the official installer from python.org:"
-    echo "   👉  https://www.python.org/downloads/macos/"
-    echo ""
-    echo "   Then re-run this script."
+    PKG_TMP="$(mktemp -t claude-python)" && PKG_TMP="${PKG_TMP}.pkg"
+    if ! curl -fSL --progress-bar "$PYTHON_PKG_URL" -o "$PKG_TMP"; then
+        echo "❌  Couldn't download Python. Check your internet connection and try again."
+        exit 1
+    fi
+    echo "   Installing… (enter your Mac password if prompted)"
+    if ! sudo installer -pkg "$PKG_TMP" -target / ; then
+        echo "❌  Python installation failed. Install it manually from"
+        echo "    https://www.python.org/downloads/macos/  then run this command again."
+        rm -f "$PKG_TMP"
+        exit 1
+    fi
+    rm -f "$PKG_TMP"
+    # python.org ships a helper that installs root SSL certificates so HTTPS
+    # (and therefore pip) works. Run it quietly if present.
+    CERTS="/Applications/Python ${PYTHON_PKG_MM}/Install Certificates.command"
+    [ -f "$CERTS" ] && /bin/bash "$CERTS" >/dev/null 2>&1 || true
+    hash -r 2>/dev/null || true
+    BASE_PYTHON=$(find_base_python || true)
+fi
+
+if [ -z "$BASE_PYTHON" ]; then
+    echo "❌  Still couldn't find a working Python after installation."
+    echo "    Please install from https://www.python.org/downloads/macos/ and re-run."
     exit 1
 fi
 
