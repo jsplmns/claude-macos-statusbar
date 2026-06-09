@@ -125,7 +125,8 @@ Download the latest ZIP (Step 2) and run the installer again (Step 3). Your conn
 ```bash
 launchctl unload ~/Library/LaunchAgents/com.user.claude-tracker.plist
 rm ~/Library/LaunchAgents/com.user.claude-tracker.plist
-rm -rf ~/.claude_tracker_venv ~/.claude_tracker.json ~/.claude_usage_history.jsonl
+rm -rf "$HOME/Applications/Claude Tracker.app"
+rm -rf ~/.claude_tracker_venv ~/.claude-statusbar ~/.claude_tracker.json ~/.claude_usage_history.jsonl
 ```
 
 To also remove the saved key from your Keychain: open **Keychain Access**, search for

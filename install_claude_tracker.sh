@@ -159,8 +159,64 @@ fi
 
 chmod +x "$APP_SCRIPT"
 
+# ── Build "Claude Tracker.app" ────────────────────────────────────────────────
+# Packaging as a real .app makes macOS show "Claude Tracker" (not "Python") in
+# the Touch ID prompt and elsewhere. py2app alias mode keeps it tiny and quick.
+# If the build fails for any reason we fall back to running the script directly.
+echo ""
+echo "🏷️   Building Claude Tracker.app ..."
+APP_DEST="$HOME/Applications/Claude Tracker.app"
+BUNDLE_EXEC=""
+if "$PYTHON" -m pip install --quiet py2app 2>/dev/null; then
+    BUILD_TMP="$SCRIPT_DIR/.app_build"
+    rm -rf "$BUILD_TMP"; mkdir -p "$BUILD_TMP"
+    ICON_LINE=""
+    [ -f "$SCRIPT_DIR/assets/icon.icns" ] && ICON_LINE="        \"iconfile\": \"$SCRIPT_DIR/assets/icon.icns\","
+    cat > "$BUILD_TMP/setup.py" <<PYSETUP
+from setuptools import setup
+setup(
+    app=["$APP_SCRIPT"],
+    options={"py2app": {
+$ICON_LINE
+        "plist": {
+            "CFBundleName": "Claude Tracker",
+            "CFBundleDisplayName": "Claude Tracker",
+            "CFBundleIdentifier": "com.jsplmns.claude-tracker",
+            "LSUIElement": True,
+            "CFBundleShortVersionString": "1.0",
+        },
+    }},
+)
+PYSETUP
+    if ( cd "$BUILD_TMP" && "$PYTHON" setup.py py2app -A >/dev/null 2>&1 ); then
+        BUILT_APP=$(/bin/ls -d "$BUILD_TMP/dist/"*.app 2>/dev/null | head -1)
+        if [ -n "$BUILT_APP" ]; then
+            mkdir -p "$HOME/Applications"
+            rm -rf "$APP_DEST"
+            mv "$BUILT_APP" "$APP_DEST"
+            BUNDLE_EXEC=$(/usr/bin/find "$APP_DEST/Contents/MacOS" -maxdepth 1 -type f 2>/dev/null | head -1)
+        fi
+    fi
+    rm -rf "$BUILD_TMP"
+fi
+
+if [ -n "$BUNDLE_EXEC" ]; then
+    echo "✅  Built: $APP_DEST"
+else
+    echo "⚠️   Couldn't build the app bundle — running the script directly instead."
+    echo "    (Everything works; the Touch ID prompt may just show \"Python\".)"
+fi
+
+# How the app gets launched (bundle if we built one, otherwise the venv Python).
+if [ -n "$BUNDLE_EXEC" ]; then
+    PROG_ARGS="        <string>${BUNDLE_EXEC}</string>"
+else
+    PROG_ARGS="        <string>${PYTHON}</string>
+        <string>${APP_SCRIPT}</string>"
+fi
+
 # ── Kill any existing instance ────────────────────────────────────────────────
-OLD_PID=$(pgrep -f "python.*claude_tracker.py" 2>/dev/null || true)
+OLD_PID=$(pgrep -f "claude_tracker.py|Claude Tracker.app" 2>/dev/null || true)
 if [ -n "$OLD_PID" ]; then
     echo ""
     echo "🔄  Stopping existing instance (PID $OLD_PID)..."
@@ -172,12 +228,13 @@ fi
 echo ""
 # Read from the terminal even when the installer is piped from curl. If there's
 # no terminal to ask (fully non-interactive), default to enabling autostart.
+AUTOSTART="y"
+PROMPT="   Launch Claude Tracker automatically at every login? [Y/n] "
 if [ -t 0 ]; then
-    read -r -p "   Launch Claude Tracker automatically at every login? [Y/n] " AUTOSTART
-elif [ -r /dev/tty ]; then
-    read -r -p "   Launch Claude Tracker automatically at every login? [Y/n] " AUTOSTART < /dev/tty
+    read -r -p "$PROMPT" AUTOSTART || AUTOSTART="y"
+elif read -r -p "$PROMPT" AUTOSTART < /dev/tty 2>/dev/null; then
+    :   # answered via the controlling terminal (curl | bash case)
 else
-    AUTOSTART="y"
     echo "   Enabling automatic launch at login (default)."
 fi
 echo ""
@@ -196,8 +253,7 @@ if [[ ! "$AUTOSTART" =~ ^[Nn]$ ]]; then
 
     <key>ProgramArguments</key>
     <array>
-        <string>${PYTHON}</string>
-        <string>${APP_SCRIPT}</string>
+${PROG_ARGS}
     </array>
 
     <key>RunAtLoad</key>
@@ -220,10 +276,12 @@ PLIST
     echo "✅  Auto-start enabled. Claude Tracker will appear at every login."
     echo "   To remove:  launchctl unload '$PLIST_PATH' && rm '$PLIST_PATH'"
 else
-    # One-shot background launch using the venv Python
-    nohup "$PYTHON" "$APP_SCRIPT" \
-        > "$LOG_OUT" \
-        2> "$LOG_ERR" &
+    # One-shot background launch (bundle if available, else the venv Python)
+    if [ -n "$BUNDLE_EXEC" ]; then
+        nohup "$BUNDLE_EXEC" > "$LOG_OUT" 2> "$LOG_ERR" &
+    else
+        nohup "$PYTHON" "$APP_SCRIPT" > "$LOG_OUT" 2> "$LOG_ERR" &
+    fi
     NEW_PID=$!
     sleep 2
 

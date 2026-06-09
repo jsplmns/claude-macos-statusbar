@@ -34,7 +34,7 @@ except Exception as e:
 
 # ── Config ─────────────────────────────────────────────────────────────────────
 
-APP_NAME      = "Claude Statusbar"   # shown in system dialogs (Touch ID, alerts)
+APP_NAME      = "Claude Tracker"   # shown in system dialogs (Touch ID, alerts)
 CONFIG_PATH   = Path.home() / ".claude_tracker.json"
 HISTORY_PATH  = Path.home() / ".claude_usage_history.jsonl"
 ICON_PATH     = Path(__file__).resolve().parent / "assets" / "icon.png"
@@ -141,6 +141,33 @@ def _keychain_delete() -> None:
     _kc_cache["key"] = ""
 
 
+def _touch_id_reason() -> str:
+    """The Touch ID prompt reason, in the user's system language when known.
+
+    macOS writes the surrounding dialog text in the user's language, so the
+    reason should match — otherwise (e.g. on a German Mac) you get an English
+    sentence inside a German prompt. Falls back to English for other locales.
+    """
+    translations = {
+        "en": "Confirm it's you to save your Claude session key securely in your Keychain.",
+        "de": "Bestätige, dass du es bist, um deinen Claude-Sitzungsschlüssel sicher im Schlüsselbund zu speichern.",
+        "es": "Confirma que eres tú para guardar tu clave de sesión de Claude de forma segura en el Llavero.",
+        "fr": "Confirmez que c'est bien vous pour enregistrer votre clé de session Claude en toute sécurité dans votre trousseau.",
+        "it": "Conferma la tua identità per salvare la chiave di sessione di Claude in modo sicuro nel portachiavi.",
+        "pt": "Confirme que é você para guardar a sua chave de sessão do Claude com segurança nas Senhas.",
+        "nl": "Bevestig dat jij het bent om je Claude-sessiesleutel veilig in je sleutelhanger te bewaren.",
+    }
+    lang = "en"
+    try:
+        from Foundation import NSLocale
+        prefs = NSLocale.preferredLanguages()
+        if prefs and len(prefs) > 0:
+            lang = str(prefs[0]).split("-")[0].split("_")[0].lower()
+    except Exception:
+        pass
+    return translations.get(lang, translations["en"])
+
+
 def touch_id_confirm(reason: str) -> bool:
     """Confirm the user's identity via Touch ID (with login-password fallback).
 
@@ -156,11 +183,9 @@ def touch_id_confirm(reason: str) -> bool:
     try:
         ctx    = LA.LAContext.alloc().init()
         policy = LA.LAPolicyDeviceOwnerAuthentication   # Touch ID OR login password
-        # If Touch ID fails/unavailable, fall back to the Mac login password.
-        try:
-            ctx.setLocalizedFallbackTitle_("Use your Mac login password…")
-        except Exception:
-            pass
+        # Leave the fallback button to macOS so it's shown in the user's
+        # language (setting our own string would force English into an
+        # otherwise localized dialog).
         can, _ = ctx.canEvaluatePolicy_error_(policy, None)
         if not can:
             return True
@@ -1178,9 +1203,7 @@ class ClaudeTracker(rumps.App):
                 return
 
             # Confirm it's really you before writing the credential to the Keychain.
-            if not touch_id_confirm(
-                    "Confirm it's you to save your Claude session key securely "
-                    "in your macOS Keychain."):
+            if not touch_id_confirm(_touch_id_reason()):
                 rumps.alert(title="Not saved",
                             message="Touch ID wasn't confirmed, so your session key "
                                     "was not saved. You can try connecting again anytime.",
