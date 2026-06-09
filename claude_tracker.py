@@ -429,9 +429,23 @@ def _looks_like_cloudflare(raw: str | None) -> bool:
     ))
 
 
+def _ssl_context() -> ssl.SSLContext:
+    """A verified SSL context that works even on a fresh python.org install.
+
+    python.org's Python ships without populating the system trust store, so a
+    plain create_default_context() raises 'unable to get local issuer
+    certificate' and every request fails. certifi (installed into the venv)
+    provides a known-good CA bundle and sidesteps that entirely.
+    """
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
+
 def _conn(session_key: str) -> tuple[http.client.HTTPSConnection, dict]:
-    ctx = ssl.create_default_context()
-    c   = http.client.HTTPSConnection("claude.ai", timeout=10, context=ctx)
+    c   = http.client.HTTPSConnection("claude.ai", timeout=10, context=_ssl_context())
     h   = {**_HEADERS, "Cookie": f"sessionKey={session_key}"}
     return c, h
 
@@ -1369,6 +1383,30 @@ class ClaudeTracker(rumps.App):
             self._i_timer.title = f"  ↺  {cd}" if cd else "  ↺  —"
 
 
+def _install_edit_menu(app) -> None:
+    """Give the app an Edit menu so ⌘C / ⌘V / ⌘X / ⌘A work in text fields.
+
+    Menu-bar (accessory) apps have no menu bar, so the standard clipboard
+    shortcuts have nowhere to route — without this, paste only works via
+    right-click. A minimal Edit menu wires up the key equivalents (no visible
+    menu bar appears for an accessory app).
+    """
+    try:
+        from AppKit import NSMenu, NSMenuItem
+        main = NSMenu.alloc().init()
+        container = NSMenuItem.alloc().init()
+        main.addItem_(container)
+        edit = NSMenu.alloc().initWithTitle_("Edit")
+        for title, sel, key in (("Cut", "cut:", "x"), ("Copy", "copy:", "c"),
+                                ("Paste", "paste:", "v"), ("Select All", "selectAll:", "a")):
+            edit.addItem_(
+                NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(title, sel, key))
+        container.setSubmenu_(edit)
+        app.setMainMenu_(main)
+    except Exception:
+        pass
+
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -1404,6 +1442,7 @@ if __name__ == "__main__":
                                 NSApplicationActivationPolicyAccessory)
             app = NSApplication.sharedApplication()
             app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+            _install_edit_menu(app)   # enable ⌘C/⌘V in dialogs
             # Custom app icon → shown in every dialog (Connect, History, alerts).
             if ICON_PATH.exists():
                 icon = NSImage.alloc().initWithContentsOfFile_(str(ICON_PATH))

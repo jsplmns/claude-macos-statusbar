@@ -142,9 +142,9 @@ echo ""
 echo "📦  Installing dependencies into venv..."
 "$PYTHON" -m pip install --quiet --upgrade pip
 # rumps → the menu bar app. LocalAuthentication → Touch ID confirmation when
-# saving the session key to the Keychain (optional; the app degrades gracefully
-# if it's ever missing).
-"$PYTHON" -m pip install --quiet --upgrade rumps pyobjc-framework-LocalAuthentication
+# saving the session key to the Keychain. certifi → CA certificates so HTTPS
+# works even on a fresh python.org Python (which ships without them).
+"$PYTHON" -m pip install --quiet --upgrade rumps pyobjc-framework-LocalAuthentication certifi
 echo "✅  dependencies installed."
 
 # ── Sanity-check import ───────────────────────────────────────────────────────
