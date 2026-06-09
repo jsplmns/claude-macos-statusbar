@@ -50,7 +50,9 @@ HISTORY_MAX_DAYS     = 90   # rolling retention window
 # v2: org selection became capability-aware (Teams/Pro/Max vs. the empty
 #     personal org), so any org_id picked by the old "first org" logic is
 #     cleared on upgrade and re-detected.
-SCHEMA_VERSION = 2
+# v3: plan detection now tells Pro from Free via billing, so cached plans are
+#     cleared on upgrade and re-detected.
+SCHEMA_VERSION = 3
 
 DEFAULTS: dict = {
     "messages_used":    0,
@@ -221,9 +223,12 @@ def load_cfg() -> dict:
     cfg.update(d)
     dirty = False
 
-    # Self-heal older configs: re-detect the subscription org (v2 logic).
+    # Self-heal older configs: re-detect the subscription org (v2) and the
+    # plan (v3). Clearing plan/account_email forces a fresh identity fetch.
     if d.get("schema_version", 1) < SCHEMA_VERSION:
         cfg["org_id"]         = ""
+        cfg["plan"]           = None
+        cfg["account_email"]  = None
         cfg["schema_version"] = SCHEMA_VERSION
         dirty = True
 
@@ -601,15 +606,21 @@ def fetch_live_usage(session_key: str, org_id: str) -> dict | None:
 def _plan_label(org: dict) -> str:
     """Human-readable plan name derived from an organization object.
 
-    claude.ai doesn't expose a tidy 'plan' field, but the org's rate-limit tier
-    and raven_type encode it: Team/Enterprise via raven, otherwise the consumer
-    tiers (Free / Pro / Max, with Max carrying a 5× or 20× multiplier).
+    claude.ai doesn't expose a tidy 'plan' field, so we infer it:
+      • Team / Enterprise come from raven_type / the rate-limit tier.
+      • Max (with its 5×/20× multiplier) shows up in the rate-limit tier.
+      • Pro vs Free can't be told from the tier alone — a personal org reports
+        'default_claude_ai' whether it's Free or Pro. The distinguisher is
+        billing: Pro is a paid (Stripe) subscription, Free has none.
     """
-    raven = (org.get("raven_type") or "").lower()
-    tier  = (org.get("rate_limit_tier") or "").lower()
+    raven   = (org.get("raven_type") or "").lower()
+    tier    = (org.get("rate_limit_tier") or "").lower()
+    billing = (org.get("billing_type") or "").lower()
+    paid    = billing not in ("", "api_evaluation")   # an active paid subscription
+
     if raven == "team" or "raven" in tier:
         return "Team"
-    if raven in ("enterprise", "ent"):
+    if raven in ("enterprise", "ent") or "enterprise" in tier:
         return "Enterprise"
     if "max" in tier:
         if "20" in tier: return "Max 20×"
@@ -617,9 +628,12 @@ def _plan_label(org: dict) -> str:
         return "Max"
     if "pro" in tier:
         return "Pro"
+    if paid:
+        # Paying personal subscriber that isn't Max/Team → Pro.
+        return "Pro"
     if "free" in tier or tier in ("default_claude_ai", ""):
         return "Free"
-    return tier.replace("default_", "").replace("_", " ").title()
+    return tier.replace("default_", "").replace("_", " ").title() or "Free"
 
 
 def pro_threshold(plan: str | None) -> float:
