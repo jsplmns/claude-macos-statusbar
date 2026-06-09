@@ -636,18 +636,23 @@ def _plan_label(org: dict) -> str:
     return tier.replace("default_", "").replace("_", " ").title() or "Free"
 
 
-def pro_threshold(plan: str | None) -> float:
-    """Utilization % that roughly equals a Pro plan's capacity, given the tier.
+def plan_comparison(plan: str | None) -> tuple[float, str] | None:
+    """Reference line for the history chart: (threshold_pct, label), or None.
 
-    Max 20× grants ~20× Pro, so a full Pro plan ≈ 5% of a Max-20× window;
-    Max 5× ≈ 20%. For other tiers we fall back to the common ~1/5 heuristic.
-    Peaks under this line would also have fit on Pro — above it is where a
-    larger plan actually earns its cost.
+    Only meaningful for plans you could actually step down from:
+      • Max → compare to Pro (Pro ≈ 5% of a Max-20× window, ≈20% of Max-5×).
+      • Team Premium → compare to a Team Standard seat (≈20%, i.e. ~5× less).
+    For Free / Pro / Team Standard / Enterprise there's no cheaper equivalent to
+    compare against, so we return None and draw no line.
     """
     p = (plan or "").lower()
-    if "20" in p:
-        return 5.0
-    return 20.0
+    if "team premium" in p:
+        return (20.0, "Standard ≈ 20%")
+    if "max" in p:
+        if "20" in p:
+            return (5.0, "Pro ≈ 5%")
+        return (20.0, "Pro ≈ 20%")
+    return None
 
 
 def _pretty_role(role: str | None) -> str | None:
@@ -1274,7 +1279,7 @@ class ClaudeTracker(rumps.App):
     # ── History chart ───────────────────────────────────────────────────────
 
     @classmethod
-    def _draw_history_chart(cls, daily: dict, pro_pct: float = 20.0,
+    def _draw_history_chart(cls, daily: dict, comparison: tuple | None = None,
                             per_day: float = 18.0, min_width: float = 448.0,
                             height: float = 172.0):
         """Render the full daily-peak history (oldest→newest) as an NSImage.
@@ -1337,17 +1342,20 @@ class ClaudeTracker(rumps.App):
                 cx = pad_l + slot * idx + slot / 2.0
                 label(_fmt_day(keys[idx], "%d %b"), cx - 14, 6)
 
-        # Pro-equivalent reference line — its height adapts to the plan tier
-        # (≈5% on Max 20×, ≈20% on Max 5×). Peaks under it would also have fit
-        # on Pro; peaks above it are where a larger plan earns its keep.
-        ry = pad_b + plot_h * min(max(pro_pct, 0.0), 100.0) / 100.0
-        NSColor.systemRedColor().colorWithAlphaComponent_(0.85).setStroke()
-        ref = NSBezierPath.bezierPath()
-        ref.moveToPoint_((pad_l, ry)); ref.lineToPoint_((W - pad_r, ry))
-        ref.setLineWidth_(1.2)
-        ref.setLineDash_count_phase_([4.0, 3.0], 2, 0.0)
-        ref.stroke()
-        label(f"Pro ≈ {pro_pct:.0f}%", pad_l + 3, ry + 2, 8.5, NSColor.systemRedColor())
+        # Down-a-tier reference line — only for plans with a cheaper equivalent
+        # to compare against (Max → Pro, Team Premium → Standard). Peaks under it
+        # would also have fit on the cheaper plan; peaks above are where the
+        # bigger plan earns its keep. Omitted entirely for everyone else.
+        if comparison:
+            ref_pct, ref_label = comparison
+            ry = pad_b + plot_h * min(max(ref_pct, 0.0), 100.0) / 100.0
+            NSColor.systemRedColor().colorWithAlphaComponent_(0.85).setStroke()
+            ref = NSBezierPath.bezierPath()
+            ref.moveToPoint_((pad_l, ry)); ref.lineToPoint_((W - pad_r, ry))
+            ref.setLineWidth_(1.2)
+            ref.setLineDash_count_phase_([4.0, 3.0], 2, 0.0)
+            ref.stroke()
+            label(ref_label, pad_l + 3, ry + 2, 8.5, NSColor.systemRedColor())
 
         img.unlockFocus()
         img.setTemplate_(False)
@@ -1408,9 +1416,8 @@ class ClaudeTracker(rumps.App):
             from Foundation import NSMakeRect, NSMakePoint
 
             VIEW_W  = 448.0   # visible chart width inside the dialog
-            plan    = self.cfg.get("plan") or "Claude"
-            pro_pct = pro_threshold(plan)
-            chart   = self._draw_history_chart(daily, pro_pct=pro_pct, min_width=VIEW_W)
+            comp    = plan_comparison(self.cfg.get("plan"))
+            chart   = self._draw_history_chart(daily, comparison=comp, min_width=VIEW_W)
             cw, ch  = chart.size().width, chart.size().height
 
             alert = NSAlert.alloc().init()
