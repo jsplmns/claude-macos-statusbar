@@ -3,5 +3,6 @@ __pycache__/
 *.pyo
 .DS_Store
 .claude_tracker.json
+.claude_usage_history.jsonl
 .claude_tracker_debug.txt
 .claude_tracker_crash.log

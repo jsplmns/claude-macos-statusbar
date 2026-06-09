@@ -4,13 +4,16 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-APP_SCRIPT="$SCRIPT_DIR/claude_tracker.py"
 VENV_DIR="$HOME/.claude_tracker_venv"      # isolated venv – avoids PEP 668
 PLIST_LABEL="com.user.claude-tracker"
 PLIST_PATH="$HOME/Library/LaunchAgents/$PLIST_LABEL.plist"
 LOG_OUT="$HOME/Library/Logs/claude-tracker.log"
 LOG_ERR="$HOME/Library/Logs/claude-tracker-error.log"
+
+# Where to fetch the app from when run via `curl … | bash` (no local files).
+REPO_SLUG="jsplmns/claude-macos-statusbar"
+REPO_BRANCH="main"
+BOOTSTRAP_DIR="$HOME/.claude-statusbar"    # stable home for the curl|bash case
 
 echo ""
 echo "╔══════════════════════════════════════════════╗"
@@ -18,10 +21,26 @@ echo "║   Claude AI Usage Tracker – Installer        ║"
 echo "╚══════════════════════════════════════════════╝"
 echo ""
 
-# ── Verify the app script exists ──────────────────────────────────────────────
+# ── Locate the app files ──────────────────────────────────────────────────────
+# If the installer is run from a cloned/unzipped repo, use those files. If it's
+# piped straight from the web (curl … | bash), download the repo first.
+if [ -n "${BASH_SOURCE:-}" ] && [ -f "$(dirname "${BASH_SOURCE[0]}")/claude_tracker.py" ]; then
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+else
+    echo "📥  Downloading Claude Statusbar…"
+    mkdir -p "$BOOTSTRAP_DIR"
+    if ! curl -fsSL "https://github.com/$REPO_SLUG/archive/refs/heads/$REPO_BRANCH.tar.gz" \
+            | tar -xz -C "$BOOTSTRAP_DIR" --strip-components=1; then
+        echo "❌  Download failed. Check your internet connection and try again."
+        exit 1
+    fi
+    SCRIPT_DIR="$BOOTSTRAP_DIR"
+    echo "✅  Downloaded to $BOOTSTRAP_DIR"
+fi
+APP_SCRIPT="$SCRIPT_DIR/claude_tracker.py"
+
 if [ ! -f "$APP_SCRIPT" ]; then
     echo "❌  App script not found: $APP_SCRIPT"
-    echo "   Make sure claude_tracker.py is in the same folder as this script."
     exit 1
 fi
 
@@ -97,12 +116,15 @@ fi
 PYTHON="$VENV_DIR/bin/python3"
 echo "✅  venv Python: $PYTHON"
 
-# ── Install rumps inside the venv ─────────────────────────────────────────────
+# ── Install dependencies inside the venv ──────────────────────────────────────
 echo ""
-echo "📦  Installing 'rumps' into venv..."
+echo "📦  Installing dependencies into venv..."
 "$PYTHON" -m pip install --quiet --upgrade pip
-"$PYTHON" -m pip install --quiet --upgrade rumps
-echo "✅  rumps installed."
+# rumps → the menu bar app. LocalAuthentication → Touch ID confirmation when
+# saving the session key to the Keychain (optional; the app degrades gracefully
+# if it's ever missing).
+"$PYTHON" -m pip install --quiet --upgrade rumps pyobjc-framework-LocalAuthentication
+echo "✅  dependencies installed."
 
 # ── Sanity-check import ───────────────────────────────────────────────────────
 echo ""
@@ -127,10 +149,19 @@ fi
 
 # ── Auto-start at login? ──────────────────────────────────────────────────────
 echo ""
-read -r -p "   Launch Claude Tracker automatically at every login? [y/N] " AUTOSTART
+# Read from the terminal even when the installer is piped from curl. If there's
+# no terminal to ask (fully non-interactive), default to enabling autostart.
+if [ -t 0 ]; then
+    read -r -p "   Launch Claude Tracker automatically at every login? [Y/n] " AUTOSTART
+elif [ -r /dev/tty ]; then
+    read -r -p "   Launch Claude Tracker automatically at every login? [Y/n] " AUTOSTART < /dev/tty
+else
+    AUTOSTART="y"
+    echo "   Enabling automatic launch at login (default)."
+fi
 echo ""
 
-if [[ "$AUTOSTART" =~ ^[Yy]$ ]]; then
+if [[ ! "$AUTOSTART" =~ ^[Nn]$ ]]; then
     mkdir -p "$HOME/Library/LaunchAgents"
     # LaunchAgent uses the venv Python so it always has rumps available
     cat > "$PLIST_PATH" <<PLIST
