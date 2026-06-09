@@ -404,15 +404,14 @@ def _pct_and_cd(cfg: dict) -> tuple[float, str | None]:
 _HEADERS = {
     "Accept":          "application/json",
     "Content-Type":    "application/json",
+    # Safari UA — coherent with the macOS (NSURLSession) TLS fingerprint we
+    # send requests through, so Cloudflare sees a consistent, native-looking
+    # client instead of a UA/TLS mismatch that screams "bot".
     "User-Agent":      (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15"
     ),
     "Referer":         "https://claude.ai/",
-    # Look like the real claude.ai web app to reduce Cloudflare friction on
-    # machines that haven't warmed up a browser session. (No Accept-Encoding —
-    # http.client won't auto-decompress gzip and JSON parsing would fail.)
     "Origin":          "https://claude.ai",
     "Accept-Language": "en-US,en;q=0.9",
     "Sec-Fetch-Site":  "same-origin",
@@ -444,16 +443,59 @@ def _ssl_context() -> ssl.SSLContext:
         return ssl.create_default_context()
 
 
-def _conn(session_key: str) -> tuple[http.client.HTTPSConnection, dict]:
-    c   = http.client.HTTPSConnection("claude.ai", timeout=10, context=_ssl_context())
-    h   = {**_HEADERS, "Cookie": f"sessionKey={session_key}"}
-    return c, h
+def _get_nsurl(session_key: str, path: str) -> tuple[int, dict | None, str]:
+    """Fetch via macOS's own networking stack (NSURLSession).
 
+    This is the same stack Safari uses, so the TLS/HTTP fingerprint looks like
+    native Mac traffic — which Cloudflare lets through far more reliably than
+    Python's, the usual reason connecting works on one Mac but not another.
+    """
+    import threading
+    from Foundation import (NSURL, NSMutableURLRequest, NSURLSession,
+                            NSURLSessionConfiguration, NSString,
+                            NSUTF8StringEncoding)
 
-def _get(session_key: str, path: str) -> tuple[int, dict | None, http.client.HTTPResponse, str]:
+    url = NSURL.URLWithString_("https://claude.ai" + path)
+    req = NSMutableURLRequest.requestWithURL_cachePolicy_timeoutInterval_(url, 1, 15.0)
+    req.setHTTPMethod_("GET")
+    req.setValue_forHTTPHeaderField_(f"sessionKey={session_key}", "Cookie")
+    for k, v in _HEADERS.items():
+        req.setValue_forHTTPHeaderField_(v, k)
+
+    session = NSURLSession.sessionWithConfiguration_(
+        NSURLSessionConfiguration.ephemeralSessionConfiguration())
+    out  = {"status": 0, "raw": ""}
+    done = threading.Event()
+
+    def handler(data, response, error):
+        try:
+            if error is not None:
+                out["raw"] = str(error.localizedDescription())
+            else:
+                if response is not None:
+                    out["status"] = int(response.statusCode())
+                if data is not None:
+                    s = NSString.alloc().initWithData_encoding_(data, NSUTF8StringEncoding)
+                    out["raw"] = str(s) if s is not None else ""
+        finally:
+            done.set()
+
+    task = session.dataTaskWithRequest_completionHandler_(req, handler)
+    task.resume()
+    if not done.wait(timeout=20):
+        return 0, None, "timed out"
+    raw = out["raw"]
     try:
-        c, h = _conn(session_key)
-        c.request("GET", path, headers=h)
+        body = json.loads(raw)
+    except Exception:
+        body = None
+    return out["status"], body, raw
+
+
+def _get_httpclient(session_key: str, path: str) -> tuple[int, dict | None, http.client.HTTPResponse, str]:
+    try:
+        c = http.client.HTTPSConnection("claude.ai", timeout=10, context=_ssl_context())
+        c.request("GET", path, headers={**_HEADERS, "Cookie": f"sessionKey={session_key}"})
         r   = c.getresponse()
         raw = r.read().decode("utf-8", errors="replace")
         try:
@@ -463,6 +505,18 @@ def _get(session_key: str, path: str) -> tuple[int, dict | None, http.client.HTT
         return r.status, body, r, raw
     except Exception as e:
         return 0, None, None, str(e)
+
+
+def _get(session_key: str, path: str) -> tuple[int, dict | None, http.client.HTTPResponse | None, str]:
+    # Prefer the OS networking stack (native fingerprint passes Cloudflare); fall
+    # back to Python's http.client only if it isn't usable (e.g. no PyObjC).
+    try:
+        status, body, raw = _get_nsurl(session_key, path)
+        if status != 0:
+            return status, body, None, raw
+    except Exception:
+        pass
+    return _get_httpclient(session_key, path)
 
 
 def _select_org(orgs: list) -> dict | None:
