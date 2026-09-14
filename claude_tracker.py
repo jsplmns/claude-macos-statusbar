@@ -64,8 +64,7 @@ DEFAULTS: dict = {
     "live_mode":        False,
     "utilization_5h":   None,
     "utilization_7d":   None,
-    "utilization_opus_7d":   None,
-    "utilization_sonnet_7d": None,
+    "model_limits":     [],   # per-model weekly limits, e.g. Fable / Opus
     "reset_7d":         None,
     "plan":             None,
     # Identity / account metadata for the Dashboard (cached once per connect).
@@ -735,6 +734,42 @@ def fetch_identity(session_key: str, org_id: str) -> dict:
     return out
 
 
+def _parse_model_limits(body: dict) -> list:
+    """Per-model weekly limits as [{name, pct, resets_at}].
+
+    The current API exposes a self-describing `limits` array in which a
+    "weekly_scoped" entry carries scope.model.display_name (e.g. "Fable"), so
+    newly released models show up automatically with no code change. Older
+    responses only had fixed seven_day_opus / seven_day_sonnet fields, which we
+    still read as a fallback.
+    """
+    out, seen = [], set()
+    for entry in (body.get("limits") or []):
+        if not isinstance(entry, dict) or entry.get("kind") != "weekly_scoped":
+            continue
+        scope = entry.get("scope")
+        model = (scope or {}).get("model") if isinstance(scope, dict) else None
+        name  = (model or {}).get("display_name")
+        pct   = entry.get("percent")
+        if not name or pct is None or str(name).lower() in seen:
+            continue
+        try:
+            out.append({"name": str(name), "pct": float(pct),
+                        "resets_at": entry.get("resets_at")})
+        except (TypeError, ValueError):
+            continue
+        seen.add(str(name).lower())
+    if out:
+        return out
+
+    for field, name in (("seven_day_opus", "Opus"), ("seven_day_sonnet", "Sonnet")):
+        d = body.get(field)
+        if isinstance(d, dict) and d.get("utilization") is not None:
+            out.append({"name": name, "pct": float(d["utilization"]),
+                        "resets_at": d.get("resets_at")})
+    return out
+
+
 def _parse_usage_body(body: dict | list) -> dict | None:
     if isinstance(body, list):
         return None
@@ -749,13 +784,8 @@ def _parse_usage_body(body: dict | list) -> dict | None:
         if isinstance(sd, dict) and sd.get("utilization") is not None:
             result["utilization_7d"] = float(sd["utilization"])
             result["reset_7d"]       = sd.get("resets_at")
-        # Per-model weekly limits (Opus is usually the first to run out on Max).
-        opus = body.get("seven_day_opus")
-        son  = body.get("seven_day_sonnet")
-        if isinstance(opus, dict) and opus.get("utilization") is not None:
-            result["utilization_opus_7d"] = float(opus["utilization"])
-        if isinstance(son, dict) and son.get("utilization") is not None:
-            result["utilization_sonnet_7d"] = float(son["utilization"])
+        # Per-model weekly limits (Fable, Opus, … — whatever the API scopes).
+        result["model_limits"] = _parse_model_limits(body)
         if result:
             return result
 
@@ -850,8 +880,8 @@ class ClaudeTracker(rumps.App):
         self._i_head   = rumps.MenuItem("Claude Usage")          # section header
         self._i_5h     = rumps.MenuItem("")                       # [bar]  5h   68%
         self._i_7d     = rumps.MenuItem("")                       # [bar]  7d   12%
-        self._i_opus   = rumps.MenuItem("")                       # [bar]  Opus 7d   8%
-        self._i_sonnet = rumps.MenuItem("")                       # [bar]  Sonnet 7d 2%
+        # Per-model weekly rows, filled dynamically (Fable, Opus, Sonnet, …)
+        self._i_models = [rumps.MenuItem("") for _ in range(5)]
         self._i_timer  = rumps.MenuItem("")                       # ↺  Resets in 1h 42m
         self._i_source = rumps.MenuItem("")                       # ●  Live  —  2m ago
 
@@ -871,8 +901,7 @@ class ClaudeTracker(rumps.App):
             None,
             self._i_5h,
             self._i_7d,
-            self._i_opus,
-            self._i_sonnet,
+            *self._i_models,
             self._i_timer,
             None,
             self._i_hist_head,
@@ -1057,21 +1086,24 @@ class ClaudeTracker(rumps.App):
             else:
                 self._hide_row(self._i_7d)
 
-            opus = cfg.get("utilization_opus_7d")
-            son  = cfg.get("utilization_sonnet_7d")
-            if opus is not None:
-                self._set_row(self._i_opus, f"Opus 7d    {opus:.0f}%", opus)
-            else:
-                self._hide_row(self._i_opus)
-            if son is not None:
-                self._set_row(self._i_sonnet, f"Sonnet 7d    {son:.0f}%", son)
-            else:
-                self._hide_row(self._i_sonnet)
+            # Per-model weekly limits, straight from the API's scoped limits.
+            models = cfg.get("model_limits") or []
+            for i, row in enumerate(self._i_models):
+                m = models[i] if i < len(models) else None
+                if m is None:
+                    self._hide_row(row)
+                    continue
+                try:
+                    mpct = float(m.get("pct"))
+                except (TypeError, ValueError):
+                    self._hide_row(row)
+                    continue
+                self._set_row(row, f"{m.get('name', 'Model')} 7d    {mpct:.0f}%", mpct)
         else:
             self._set_row(self._i_5h, f"{used} / {limit} messages", bar_pct)
             self._hide_row(self._i_7d)
-            self._hide_row(self._i_opus)
-            self._hide_row(self._i_sonnet)
+            for row in self._i_models:
+                self._hide_row(row)
 
         # ── Last 3 days ────────────────────────────────────────────────────
         self._refresh_history_rows()
@@ -1136,8 +1168,7 @@ class ClaudeTracker(rumps.App):
                 self.cfg["utilization_5h"] = pct_5h
                 self.cfg["utilization_7d"] = data.get("utilization_7d")
                 self.cfg["reset_7d"]       = data.get("reset_7d")
-                self.cfg["utilization_opus_7d"]   = data.get("utilization_opus_7d")
-                self.cfg["utilization_sonnet_7d"] = data.get("utilization_sonnet_7d")
+                self.cfg["model_limits"]   = data.get("model_limits") or []
             else:
                 for field in ("messages_used", "messages_limit", "reset_time"):
                     if field in data and data[field] is not None:
@@ -1397,9 +1428,11 @@ class ClaudeTracker(rumps.App):
         if u7 is not None:
             cd7 = countdown(cfg.get("reset_7d"))
             usage.append(f"7-day:  {u7:.0f}%" + (f"   ·  resets in {cd7}" if cd7 else ""))
-        opus, son = cfg.get("utilization_opus_7d"), cfg.get("utilization_sonnet_7d")
-        if opus is not None: usage.append(f"7-day Opus:  {opus:.0f}%")
-        if son  is not None: usage.append(f"7-day Sonnet:  {son:.0f}%")
+        for m in (cfg.get("model_limits") or []):
+            try:
+                usage.append(f"7-day {m.get('name', 'Model')}:  {float(m['pct']):.0f}%")
+            except (TypeError, ValueError, KeyError):
+                pass
         if usage:
             lines.append("")
             lines.extend(usage)
