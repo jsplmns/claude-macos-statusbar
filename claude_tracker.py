@@ -9,6 +9,8 @@ from __future__ import annotations   # allow `str | None` hints on Python 3.9
 
 import http.client
 import json
+import re
+import time
 import ssl
 import subprocess
 import sys
@@ -356,6 +358,101 @@ def _fmt_day(date: str, fmt: str = "%a %d %b") -> str:
         return datetime.strptime(date, "%Y-%m-%d").strftime(fmt)
     except Exception:
         return date
+
+
+# ── Local Claude Code sessions ────────────────────────────────────────────────
+
+CODE_SESSIONS_DIR = Path.home() / ".claude" / "projects"
+CODE_ACTIVE_SEC   = 180     # transcript touched this recently → treat as running
+
+
+def _slug_to_path(slug: str) -> Path | None:
+    """Resolve a ~/.claude/projects slug back to a real directory.
+
+    The slug is the project path with "/" replaced by "-", which is ambiguous
+    because folder names contain dashes too — so rebuild it greedily against
+    the filesystem.
+    """
+    parts = slug.lstrip("-").split("-")
+    path, i = Path("/"), 0
+    while i < len(parts):
+        for j in range(len(parts), i, -1):
+            cand = path / "-".join(parts[i:j])
+            if cand.exists():
+                path, i = cand, j
+                break
+        else:
+            return None
+    return path
+
+
+def _session_project_name(jsonl: Path, slug: str) -> str:
+    """Readable project name for a session transcript.
+
+    Prefer the project folder the session belongs to — a session's recorded cwd
+    can be a subdirectory (".../supabase/functions"), which is far less
+    recognisable than the project root it lives in.
+    """
+    resolved = _slug_to_path(slug)
+    if resolved is not None:
+        return resolved.name
+    # Folder moved or deleted — fall back to the cwd recorded in the transcript.
+    try:
+        with jsonl.open("rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 8192))
+            tail = f.read().decode("utf-8", "replace")
+        found = re.findall(r'"cwd":"([^"]+)"', tail)
+        if found:
+            return Path(found[-1]).name
+    except Exception:
+        pass
+    return slug.lstrip("-").replace("-", " ")
+
+
+def _fmt_age(sec: float) -> str:
+    m = int(sec // 60)
+    if m < 1:  return "just now"
+    if m < 60: return f"{m}m ago"
+    h, m = divmod(m, 60)
+    if h < 24: return f"{h}h {m:02d}m ago"
+    d, h = divmod(h, 24)
+    return f"{d}d {h}h ago"
+
+
+def recent_code_sessions(limit: int = 4) -> list:
+    """Recent Claude Code sessions on this Mac, newest first.
+
+    Claude Code writes one transcript per session under ~/.claude/projects/, so
+    the file's mtime is that session's last activity. These sessions draw on the
+    same usage limits as claude.ai but never appear in the web conversation
+    list — which is exactly why usage can drain while "nothing" seems to run.
+    """
+    out, seen = [], set()
+    try:
+        files = []
+        for proj in CODE_SESSIONS_DIR.iterdir():
+            if not proj.is_dir():
+                continue
+            for f in proj.glob("*.jsonl"):
+                try:
+                    files.append((f.stat().st_mtime, f, proj.name))
+                except OSError:
+                    pass
+        files.sort(key=lambda t: t[0], reverse=True)
+        now = time.time()
+        for mtime, f, slug in files:
+            name = _session_project_name(f, slug)
+            if name in seen:          # one row per project — its newest session
+                continue
+            seen.add(name)
+            age = max(0.0, now - mtime)
+            out.append({"name": name, "age_sec": age, "active": age <= CODE_ACTIVE_SEC})
+            if len(out) >= limit:
+                break
+    except Exception:
+        pass
+    return out
 
 
 def format_history_summary() -> str:
@@ -1367,10 +1464,17 @@ class ClaudeTracker(rumps.App):
                     ((x, pad_b), (bw, bh)), 2.5, 2.5
                 ).fill()
 
-            # Date labels at a readable interval, always including the latest day.
-            step = max(1, n // 8)
+            # Date labels at a readable interval, always including the latest
+            # day. Drop any that would collide with the next one so the last
+            # label never overprints the step label beside it.
+            step, picked, min_gap = max(1, n // 8), [], 46.0
             for idx in sorted(set(range(0, n, step)) | {n - 1}):
                 cx = pad_l + slot * idx + slot / 2.0
+                if picked and cx - picked[-1][1] < min_gap:
+                    picked[-1] = (idx, cx)      # keep the newer of the two
+                else:
+                    picked.append((idx, cx))
+            for idx, cx in picked:
                 label(_fmt_day(keys[idx], "%d %b"), cx - 14, 6)
 
         # Down-a-tier reference line — only for plans with a cheaper equivalent
@@ -1436,6 +1540,19 @@ class ClaudeTracker(rumps.App):
         if usage:
             lines.append("")
             lines.extend(usage)
+
+        # What's actually been consuming usage on this Mac. Claude Code sessions
+        # share these limits but are invisible in the claude.ai conversation list.
+        sessions = recent_code_sessions()
+        if sessions:
+            lines.append("")
+            live = sum(1 for s in sessions if s["active"])
+            head = "Claude Code on this Mac"
+            lines.append(f"{head}  ·  {live} running" if live else head)
+            for s in sessions:
+                mark = "●" if s["active"] else "·"
+                when = "running now" if s["active"] else _fmt_age(s["age_sec"])
+                lines.append(f"   {mark}  {s['name']}  —  {when}")
 
         if not daily:
             lines.append("")
