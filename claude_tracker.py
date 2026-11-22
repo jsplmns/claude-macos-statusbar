@@ -78,8 +78,18 @@ DEFAULTS: dict = {
     "billing_type":     None,
     "org_count":        None,
     "team_seats":       None,
+    # Multiple organizations (e.g. two Team workspaces on one account).
+    # `org_id` stays the main/selected org; its usage is mirrored into the
+    # top-level fields above. Every org's latest usage lives in `org_usage`.
+    "orgs":             [],      # [{id, name, plan}] usage-carrying orgs
+    "orgs_checked":     None,    # when the org list was last refreshed
+    "show_all_orgs":    False,   # True → one menu bar icon per organization
+    "org_usage":        {},      # org_id → {utilization_5h, …, last_updated}
+    "legacy_history_org": "",    # org that untagged (pre multi-org) history belongs to
     "schema_version":   SCHEMA_VERSION,
 }
+
+ORG_LIST_REFRESH_H = 6   # re-check which orgs the account belongs to
 
 
 # ── Keychain (session key storage) ───────────────────────────────────────────
@@ -265,8 +275,13 @@ def save_cfg(cfg: dict) -> None:
 
 # ── Usage history ──────────────────────────────────────────────────────────────
 
-def _read_history() -> list:
-    """Return history records within the retention window (oldest first)."""
+def _read_history(org_id: str | None = None, legacy: bool = True) -> list:
+    """Return history records within the retention window (oldest first).
+
+    With `org_id`, only that organization's records are returned. Records
+    written before multi-org support carry no "org" tag; they belonged to the
+    main org, so they're included only when `legacy` is set.
+    """
     if not HISTORY_PATH.exists():
         return []
     cutoff = datetime.now() - timedelta(days=HISTORY_MAX_DAYS)
@@ -278,6 +293,10 @@ def _read_history() -> list:
                 continue
             try:
                 r = json.loads(line)
+                if org_id is not None:
+                    tag = r.get("org")
+                    if tag != org_id and not (tag is None and legacy):
+                        continue
                 if datetime.fromisoformat(r["ts"]) >= cutoff:
                     records.append(r)
             except Exception:
@@ -287,14 +306,14 @@ def _read_history() -> list:
     return records
 
 
-def append_history(cfg: dict) -> None:
-    """Append a usage snapshot if >= HISTORY_INTERVAL_MIN have passed."""
-    util_5h = cfg.get("utilization_5h")
+def append_history(state: dict, org_id: str = "", legacy: bool = True) -> None:
+    """Append a usage snapshot for one org if >= HISTORY_INTERVAL_MIN have passed."""
+    util_5h = state.get("utilization_5h")
     if util_5h is None:
         return  # only log when we have live data
 
-    # Throttle: skip if last record is too recent
-    records = _read_history()
+    # Throttle: skip if this org's last record is too recent
+    records = _read_history(org_id or None, legacy)
     if records:
         try:
             last_ts = datetime.fromisoformat(records[-1]["ts"])
@@ -306,10 +325,12 @@ def append_history(cfg: dict) -> None:
     record = {
         "ts":             datetime.now().isoformat(timespec="minutes"),
         "utilization_5h": round(util_5h, 1),
-        "utilization_7d": round(cfg.get("utilization_7d") or 0.0, 1),
-        "messages_used":  cfg.get("messages_used", 0),
-        "messages_limit": cfg.get("messages_limit", 45),
+        "utilization_7d": round(state.get("utilization_7d") or 0.0, 1),
+        "messages_used":  state.get("messages_used", 0),
+        "messages_limit": state.get("messages_limit", 45),
     }
+    if org_id:
+        record["org"] = org_id
     try:
         with HISTORY_PATH.open("a") as f:
             f.write(json.dumps(record) + "\n")
@@ -455,9 +476,9 @@ def recent_code_sessions(limit: int = 4) -> list:
     return out
 
 
-def format_history_summary() -> str:
+def format_history_summary(org_id: str | None = None) -> str:
     """Plain-text daily-peak summary — fallback when the drawn chart can't load."""
-    daily = daily_peaks(_read_history())
+    daily = daily_peaks(_read_history(org_id))
     if not daily:
         return (
             "No usage history recorded yet.\n\n"
@@ -666,6 +687,67 @@ def _select_org(orgs: list) -> dict | None:
 
     candidates = [o for o in orgs if isinstance(o, dict)]
     return max(candidates, key=score) if candidates else None
+
+
+def _usage_orgs(orgs: list) -> list:
+    """Every org that carries its own claude.ai usage limits, best match first.
+
+    An account can belong to several subscriptions at once — e.g. two Team
+    workspaces, or a personal Pro plan plus a Team seat — and each has separate
+    limits. Keep chat-capable orgs that are billed or Team/Enterprise; skip the
+    empty auto-created personal org and API/Console orgs. If nothing qualifies
+    (a Free account), fall back to the single best match.
+    """
+    cands = [o for o in orgs
+             if isinstance(o, dict) and (o.get("uuid") or o.get("id"))]
+
+    def usable(o: dict) -> bool:
+        caps    = o.get("capabilities") or []
+        billing = o.get("billing_type")
+        billed  = bool(billing) and billing != "api_evaluation"
+        return "chat" in caps and (billed or "raven" in caps)
+
+    picked = [o for o in cands if usable(o)]
+    if not picked:
+        best = _select_org(cands)
+        return [best] if best else []
+    best = _select_org(picked)
+    return [best] + [o for o in picked if o is not best]
+
+
+def fetch_usage_orgs(session_key: str) -> list | None:
+    """[{id, name, plan}] for every usage-carrying org, or None on failure."""
+    status, body, _, _ = _get(session_key, "/api/organizations")
+    if status != 200 or not isinstance(body, list):
+        return None
+
+    # Seat tiers (Team Standard vs Premium) come from the account's memberships.
+    seats: dict = {}
+    s2, boot, _, _ = _get(session_key, "/api/bootstrap")
+    if s2 == 200 and isinstance(boot, dict):
+        for m in ((boot.get("account") or {}).get("memberships") or []):
+            uid = (m.get("organization") or {}).get("uuid")
+            if uid:
+                seats[uid] = (m.get("seat_tier") or "").lower()
+
+    out = []
+    for o in _usage_orgs(body):
+        oid  = o.get("uuid") or o.get("id")
+        plan = _plan_label(o)
+        if plan == "Team" and seats.get(oid) and seats[oid] != "team_standard":
+            plan = "Team Premium"
+        out.append({"id": oid, "name": o.get("name") or "Organization", "plan": plan})
+    return out
+
+
+def short_org_name(name: str | None, limit: int = 16) -> str:
+    """Compact org label for the menu bar ("Acme Corp", not "Acme Corp's Organization")."""
+    n = (name or "Org").strip()
+    for suffix in ("'s Organization", "’s Organization", " Organization"):
+        if n.endswith(suffix) and len(n) > len(suffix):
+            n = n[: -len(suffix)]
+            break
+    return n if len(n) <= limit else n[: limit - 1].rstrip() + "…"
 
 
 def fetch_org_id(session_key: str) -> str | None:
@@ -964,6 +1046,30 @@ def validate_session_key(session_key: str) -> tuple[bool, str, str]:
                        "Please try again in a moment.")
 
 
+# Per-org usage fields, mirrored between `org_usage[id]` and the top-level
+# config fields (which always describe the main org).
+USAGE_KEYS = ("utilization_5h", "utilization_7d", "reset_time", "reset_7d",
+              "model_limits", "messages_used", "messages_limit", "last_updated")
+
+
+def usage_state(data: dict, prev: dict | None = None) -> dict:
+    """Merge a fetch_live_usage() result into an org's stored usage state."""
+    st = dict(prev or {})
+    if "utilization_5h" in data:
+        st["utilization_5h"] = data["utilization_5h"]
+        st["utilization_7d"] = data.get("utilization_7d")
+        st["reset_7d"]       = data.get("reset_7d")
+        st["model_limits"]   = data.get("model_limits") or []
+        if data.get("reset_time"):
+            st["reset_time"] = data["reset_time"]
+    else:
+        for field in ("messages_used", "messages_limit", "reset_time"):
+            if data.get(field) is not None:
+                st[field] = data[field]
+    st["last_updated"] = datetime.now().isoformat()
+    return st
+
+
 # ── App ────────────────────────────────────────────────────────────────────────
 
 class ClaudeTracker(rumps.App):
@@ -972,6 +1078,9 @@ class ClaudeTracker(rumps.App):
         super().__init__("", quit_button=None)
         self.cfg          = load_cfg()
         self._fetch_error = ""
+        self._org_errors: dict = {}      # org_id → last fetch error (extra orgs)
+        self._extras: dict     = {}      # org_id → extra NSStatusItem + its rows
+        self._menubar_sig      = None    # last-built "Menu Bar" submenu signature
 
         # ── Status display (non-interactive, grayed-out in menu) ──────────
         self._i_head   = rumps.MenuItem("Claude Usage")          # section header
@@ -991,6 +1100,8 @@ class ClaudeTracker(rumps.App):
         self._disconn = rumps.MenuItem("Disconnect",            callback=self.disconnect_claude)
         self._web     = rumps.MenuItem("Open Claude.ai  ↗",     callback=self.open_web)
         self._hist    = rumps.MenuItem("Dashboard",              callback=self.show_history)
+        # Which organization(s) get a menu bar icon — filled once >1 org is found.
+        self._menubar = rumps.MenuItem("Menu Bar")
         self._qui     = rumps.MenuItem("Quit",                   callback=rumps.quit_application)
 
         self.menu = [
@@ -1006,6 +1117,7 @@ class ClaudeTracker(rumps.App):
             None,
             self._i_source,
             None,
+            self._menubar,
             self._conn,
             self._disconn,
             None,
@@ -1019,6 +1131,15 @@ class ClaudeTracker(rumps.App):
 
         if self.cfg.get("session_key") and self.cfg.get("live_mode"):
             self._do_live_fetch()
+
+        # Extra per-org icons need the running NSApp, which only exists once
+        # run() starts — so draw them on a one-shot timer right after launch.
+        self._boot_timer = rumps.Timer(self._after_launch, 1)
+        self._boot_timer.start()
+
+    def _after_launch(self, timer) -> None:
+        timer.stop()
+        self._refresh()
 
     # ── Status bar title ───────────────────────────────────────────────────
 
@@ -1081,7 +1202,16 @@ class ClaudeTracker(rumps.App):
         """Wider pill for a dropdown-menu row."""
         return cls._draw_progress_image(pct, 150.0, 12.0, bar_h=7.0)
 
-    def _set_title(self, pct: float, cd: str | None) -> None:
+    @staticmethod
+    def _title_text(pct: float | None, cd: str | None, label: str | None = None) -> str:
+        """'  68%  1h 42m', or '  Acme  68%  1h 42m' when several orgs are shown."""
+        suffix = ""
+        if cd == "now": suffix = "  ↺"
+        elif cd:        suffix = f"  {cd}"
+        text = (f"{pct:.0f}%" if pct is not None else "–") + suffix
+        return f"  {label}  {text}" if label else f"  {text}"
+
+    def _set_title(self, pct: float, cd: str | None, label: str | None = None) -> None:
         """
         Status bar: a drawn pill-progress-bar (NSImage) to the left, percentage
         and reset countdown as plain text to the right.
@@ -1090,14 +1220,9 @@ class ClaudeTracker(rumps.App):
         directly onto the underlying NSStatusItem button. If PyObjC drawing is
         unavailable, the text title still renders on its own — no block bars.
         """
-        suffix = ""
-        if cd == "now": suffix = "  ↺"
-        elif cd:        suffix = f"  {cd}"
-        text = f"{pct:.0f}%{suffix}"
-
         # rumps draws this as the button title (gracefully no-ops pre-launch).
         # Two leading spaces = gap between the drawn bar and the text.
-        self.title = f"  {text}"
+        self.title = self._title_text(pct, cd, label)
 
         # Attach the slick drawn bar to the status item button, if we can reach
         # it. self._nsapp exists only once the app is running; before that the
@@ -1139,7 +1264,7 @@ class ClaudeTracker(rumps.App):
 
     def _refresh_history_rows(self) -> None:
         """Populate the three 'Last 3 days' rows with drawn mini-bars."""
-        daily = daily_peaks(_read_history())
+        daily = daily_peaks(self._main_history())
         days  = sorted(daily.keys(), reverse=True)[:3]
 
         if not days:
@@ -1156,6 +1281,69 @@ class ClaudeTracker(rumps.App):
             else:
                 self._hide_row(item)
 
+    # ── Multi-org helpers ────────────────────────────────────────────────────
+
+    def _connected(self) -> bool:
+        return bool(self.cfg.get("live_mode") and self.cfg.get("session_key"))
+
+    def _orgs(self) -> list:
+        return [o for o in (self.cfg.get("orgs") or []) if isinstance(o, dict) and o.get("id")]
+
+    def _org(self, org_id: str | None) -> dict:
+        return next((o for o in self._orgs() if o["id"] == org_id), {})
+
+    def _multi_shown(self) -> bool:
+        """True when every organization gets its own menu bar icon."""
+        return (self._connected() and bool(self.cfg.get("show_all_orgs"))
+                and len(self._orgs()) > 1)
+
+    def _main_history(self) -> list:
+        oid = self.cfg.get("org_id") or None
+        return _read_history(oid, legacy=(oid == self.cfg.get("legacy_history_org")))
+
+    def _fill_usage_rows(self, head, r5, r7, models, timer,
+                         state: dict, header: str) -> None:
+        """Render one org's usage (5h / 7d / per-model / reset) into menu rows."""
+        head.title = header
+        u5 = state.get("utilization_5h")
+        if u5 is not None:
+            self._set_row(r5, f"5h    {u5:.0f}%", u5)
+            u7 = state.get("utilization_7d")
+            if u7 is not None:
+                self._set_row(r7, f"7d    {u7:.0f}%", u7)
+            else:
+                self._hide_row(r7)
+
+            # Per-model weekly limits, straight from the API's scoped limits.
+            ml = state.get("model_limits") or []
+            for i, row in enumerate(models):
+                m = ml[i] if i < len(ml) else None
+                try:
+                    mpct = float(m.get("pct")) if m else None
+                except (TypeError, ValueError):
+                    mpct = None
+                if mpct is None:
+                    self._hide_row(row)
+                    continue
+                self._set_row(row, f"{m.get('name', 'Model')} 7d    {mpct:.0f}%", mpct)
+        else:
+            used, limit = state.get("messages_used"), state.get("messages_limit")
+            if used is not None and limit:
+                self._set_row(r5, f"{used} / {limit} messages", used / limit * 100)
+            else:
+                self._set_row(r5, "Waiting for data…")
+            self._hide_row(r7)
+            for row in models:
+                self._hide_row(row)
+
+        cd = countdown(state.get("reset_time"))
+        if cd == "now":
+            timer.title = "  ↺  Resetting…"
+        elif cd:
+            timer.title = f"  ↺  Resets in {cd}"
+        else:
+            timer.title = "  ↺  —"
+
     # ── Display refresh ────────────────────────────────────────────────────
 
     def _refresh(self) -> None:
@@ -1166,52 +1354,23 @@ class ClaudeTracker(rumps.App):
         cd       = countdown(cfg.get("reset_time"))
         live_pct = cfg.get("utilization_5h")
         bar_pct  = live_pct if live_pct is not None else pct
+        multi    = len(self._orgs()) > 1 and self._connected()
+        main_org = self._org(cfg.get("org_id"))
 
-        # ── Status bar: drawn pill + percentage ───────────────────────────
-        self._set_title(bar_pct, cd)
+        # ── Status bar: drawn pill + percentage (+ org name if several) ────
+        label = short_org_name(main_org.get("name")) if (self._multi_shown() and main_org) else None
+        self._set_title(bar_pct, cd, label)
 
-        # ── Header: brand + detected plan ──────────────────────────────────
-        plan = cfg.get("plan")
-        self._i_head.title = f"Claude Usage  ·  {plan}" if plan else "Claude Usage"
-
-        # ── Dropdown: drawn 5h / 7d bars (+ per-model weekly) ──────────────
-        if live_pct is not None:
-            self._set_row(self._i_5h, f"5h    {bar_pct:.0f}%", bar_pct)
-            pct_7d = cfg.get("utilization_7d")
-            if pct_7d is not None:
-                self._set_row(self._i_7d, f"7d    {pct_7d:.0f}%", pct_7d)
-            else:
-                self._hide_row(self._i_7d)
-
-            # Per-model weekly limits, straight from the API's scoped limits.
-            models = cfg.get("model_limits") or []
-            for i, row in enumerate(self._i_models):
-                m = models[i] if i < len(models) else None
-                if m is None:
-                    self._hide_row(row)
-                    continue
-                try:
-                    mpct = float(m.get("pct"))
-                except (TypeError, ValueError):
-                    self._hide_row(row)
-                    continue
-                self._set_row(row, f"{m.get('name', 'Model')} 7d    {mpct:.0f}%", mpct)
-        else:
-            self._set_row(self._i_5h, f"{used} / {limit} messages", bar_pct)
-            self._hide_row(self._i_7d)
-            for row in self._i_models:
-                self._hide_row(row)
+        # ── Header: org (when there are several) + detected plan ──────────
+        plan = cfg.get("plan") or main_org.get("plan")
+        name = (main_org.get("name") or cfg.get("org_name")) if multi else None
+        head = name or "Claude Usage"
+        self._fill_usage_rows(self._i_head, self._i_5h, self._i_7d, self._i_models,
+                              self._i_timer, cfg,
+                              f"{head}  ·  {plan}" if plan else head)
 
         # ── Last 3 days ────────────────────────────────────────────────────
         self._refresh_history_rows()
-
-        # ── Reset countdown ────────────────────────────────────────────────
-        if cd == "now":
-            self._i_timer.title = "  ↺  Resetting…"
-        elif cd:
-            self._i_timer.title = f"  ↺  Resets in {cd}"
-        else:
-            self._i_timer.title = "  ↺  —"
 
         # ── Connection status ──────────────────────────────────────────────
         connected = bool(cfg.get("live_mode") and cfg.get("session_key"))
@@ -1230,6 +1389,153 @@ class ClaudeTracker(rumps.App):
             self._conn.title = "Connect to Claude.ai…"
             self._disconn.set_callback(None)   # grayed out when disconnected
 
+        self._refresh_menubar_menu()
+        self._sync_extra_items()
+
+    # ── Organization chooser ("Menu Bar" submenu) ────────────────────────────
+
+    def _refresh_menubar_menu(self) -> None:
+        """'Show all organizations' or 'Only <org>' — shown once >1 org exists."""
+        orgs = self._orgs()
+        if len(orgs) < 2 or not self._connected():
+            self._hide_row(self._menubar)
+            return
+        try:
+            self._menubar._menuitem.setHidden_(False)
+        except Exception:
+            pass
+
+        show_all = bool(self.cfg.get("show_all_orgs"))
+        main_id  = self.cfg.get("org_id")
+        sig = (tuple((o["id"], o.get("name"), o.get("plan")) for o in orgs), show_all, main_id)
+        if sig == self._menubar_sig:
+            return
+        self._menubar_sig = sig
+
+        if getattr(self._menubar, "_menu", None) is not None:
+            self._menubar.clear()
+        all_item = rumps.MenuItem("Show all organizations", callback=self._toggle_all_orgs)
+        all_item.state = 1 if show_all else 0
+        self._menubar.add(all_item)
+        self._menubar.add(rumps.separator)
+        for o in orgs:
+            title = f"Only {o.get('name') or 'Organization'}"
+            if o.get("plan"):
+                title += f"  ·  {o['plan']}"
+            it = rumps.MenuItem(title, callback=lambda _s, oid=o["id"]: self._pick_org(oid))
+            it.state = 1 if (not show_all and o["id"] == main_id) else 0
+            self._menubar.add(it)
+
+    def _mirror_main(self, state: dict) -> None:
+        """Copy an org's stored usage into the top-level (main org) fields."""
+        for k in USAGE_KEYS:
+            if k in ("messages_used", "messages_limit"):
+                continue
+            self.cfg[k] = state.get(k) if k != "model_limits" else (state.get(k) or [])
+        u5 = self.cfg.get("utilization_5h")
+        self.cfg["messages_used"] = (round(u5 / 100.0 * self.cfg["messages_limit"])
+                                     if u5 is not None else 0)
+
+    def _pick_org(self, org_id: str) -> None:
+        """Show only `org_id` in the menu bar (and make it the main org)."""
+        self.cfg["show_all_orgs"] = False
+        self._make_main(org_id)
+
+    def _make_main(self, org_id: str) -> None:
+        if org_id != self.cfg.get("org_id"):
+            self.cfg["org_id"] = org_id
+            for f in self._IDENTITY_FIELDS:   # re-detect plan/role for this org
+                self.cfg[f] = None
+            self.cfg["plan"] = self._org(org_id).get("plan")
+            self._mirror_main((self.cfg.get("org_usage") or {}).get(org_id) or {})
+            self._fetch_error = ""
+        save_cfg(self.cfg)
+        self._refresh()
+        self._do_live_fetch()
+
+    def _toggle_all_orgs(self, _) -> None:
+        self.cfg["show_all_orgs"] = not self.cfg.get("show_all_orgs")
+        save_cfg(self.cfg)
+        self._refresh()
+        if self.cfg["show_all_orgs"]:
+            self._do_live_fetch()   # fill the new icons right away
+
+    # ── Extra menu bar icons (one per additional org) ────────────────────────
+
+    def _make_extra(self, org: dict) -> dict:
+        from AppKit import NSMenu, NSMenuItem, NSStatusBar
+        oid  = org["id"]
+        item = NSStatusBar.systemStatusBar().statusItemWithLength_(-1)
+        ex = {
+            "item":   item,
+            "head":   rumps.MenuItem(""),
+            "r5":     rumps.MenuItem(""),
+            "r7":     rumps.MenuItem(""),
+            "models": [rumps.MenuItem("") for _ in range(5)],
+            "timer":  rumps.MenuItem(""),
+            "source": rumps.MenuItem(""),
+        }
+        actions = [
+            rumps.MenuItem("Make this the main icon",
+                           callback=lambda _s, o=oid: self._make_main(o)),
+            rumps.MenuItem("Show only this organization",
+                           callback=lambda _s, o=oid: self._pick_org(o)),
+            rumps.MenuItem("Open Claude.ai  ↗", callback=self.open_web),
+        ]
+        ex["actions"] = actions   # keep Python wrappers alive (callbacks)
+        menu = NSMenu.alloc().init()
+        sep  = NSMenuItem.separatorItem
+        for el in [ex["head"], None, ex["r5"], ex["r7"], *ex["models"], ex["timer"],
+                   None, ex["source"], None, *actions]:
+            menu.addItem_(sep() if el is None else el._menuitem)
+        item.setMenu_(menu)
+        ex["menu"] = menu
+        self._extras[oid] = ex
+        return ex
+
+    def _sync_extra_items(self) -> None:
+        """Add/remove/update one extra status item per non-main organization."""
+        if getattr(self, "_nsapp", None) is None:
+            return   # not launched yet — _after_launch will call us again
+        try:
+            from AppKit import NSStatusBar
+            bar = NSStatusBar.systemStatusBar()
+        except Exception:
+            return
+
+        main_id = self.cfg.get("org_id")
+        want = [o for o in self._orgs() if o["id"] != main_id] if self._multi_shown() else []
+        want_ids = {o["id"] for o in want}
+        for oid in list(self._extras):
+            if oid not in want_ids:
+                try:
+                    bar.removeStatusItem_(self._extras.pop(oid)["item"])
+                except Exception:
+                    pass
+
+        usage = self.cfg.get("org_usage") or {}
+        for o in want:
+            try:
+                ex    = self._extras.get(o["id"]) or self._make_extra(o)
+                state = usage.get(o["id"]) or {}
+                pct   = state.get("utilization_5h")
+                cd    = countdown(state.get("reset_time"))
+                btn   = ex["item"].button()
+                btn.setTitle_(self._title_text(pct, cd, short_org_name(o.get("name"))))
+                btn.setImage_(self._draw_bar_image(pct or 0.0))
+                btn.setImagePosition_(2)   # NSImageLeft
+
+                name = o.get("name") or "Organization"
+                self._fill_usage_rows(ex["head"], ex["r5"], ex["r7"], ex["models"],
+                                      ex["timer"], state,
+                                      f"{name}  ·  {o['plan']}" if o.get("plan") else name)
+                err    = self._org_errors.get(o["id"])
+                synced = time_ago(state.get("last_updated"))
+                ex["source"].title = (f"  ●  Error  —  {err}" if err else
+                                      f"  ●  Live  —  {synced}" if synced else "  ●  Live")
+            except Exception:
+                pass
+
     # ── Live fetch ─────────────────────────────────────────────────────────
 
     def _do_live_fetch(self) -> None:
@@ -1238,11 +1544,34 @@ class ClaudeTracker(rumps.App):
         if not key:
             return
 
+        # Which orgs (subscriptions) does this account have? Re-checked every
+        # few hours so a newly joined Team workspace shows up on its own.
+        if self._orgs_stale():
+            orgs = fetch_usage_orgs(key)
+            if orgs is not None:
+                self.cfg["orgs"]         = orgs
+                self.cfg["orgs_checked"] = datetime.now().isoformat()
+                ids = [o["id"] for o in orgs]
+                self.cfg["org_usage"] = {k: v for k, v in (self.cfg.get("org_usage") or {}).items()
+                                         if k in ids}
+                if org_id and ids and org_id not in ids:
+                    # The main org is gone (left the workspace) — fall back.
+                    org_id = ids[0]
+                    self.cfg["org_id"] = org_id
+                    for f in self._IDENTITY_FIELDS:
+                        self.cfg[f] = None
+                save_cfg(self.cfg)
+
         if not org_id:
-            org_id = fetch_org_id(key) or ""
+            orgs   = self._orgs()
+            org_id = (orgs[0]["id"] if orgs else fetch_org_id(key)) or ""
             if org_id:
                 self.cfg["org_id"] = org_id
                 save_cfg(self.cfg)
+
+        # History written before multi-org support belongs to this main org.
+        if org_id and not self.cfg.get("legacy_history_org"):
+            self.cfg["legacy_history_org"] = org_id
 
         # Account/org/plan metadata rarely changes — fetch once and cache.
         if org_id and not (self.cfg.get("plan") and self.cfg.get("account_email")):
@@ -1271,12 +1600,43 @@ class ClaudeTracker(rumps.App):
                     if field in data and data[field] is not None:
                         self.cfg[field] = data[field]
             self.cfg["last_updated"] = datetime.now().isoformat()
+            usage = self.cfg.get("org_usage") or {}
+            usage[org_id] = {k: self.cfg.get(k) for k in USAGE_KEYS}
+            self.cfg["org_usage"] = usage
             save_cfg(self.cfg)
-            append_history(self.cfg)
+            append_history(self.cfg, org_id,
+                           legacy=(org_id == self.cfg.get("legacy_history_org")))
         else:
             self._fetch_error = "usage endpoint unavailable"
 
+        # The other organizations' usage — only needed while their icons show.
+        if self._multi_shown():
+            usage = self.cfg.get("org_usage") or {}
+            for o in self._orgs():
+                oid = o["id"]
+                if oid == org_id:
+                    continue
+                d = fetch_live_usage(key, oid)
+                if d:
+                    usage[oid] = usage_state(d, usage.get(oid))
+                    self._org_errors.pop(oid, None)
+                    append_history(usage[oid], oid,
+                                   legacy=(oid == self.cfg.get("legacy_history_org")))
+                else:
+                    self._org_errors[oid] = "usage endpoint unavailable"
+            self.cfg["org_usage"] = usage
+            save_cfg(self.cfg)
+
         self._refresh()
+
+    def _orgs_stale(self) -> bool:
+        if not self._orgs():
+            return True
+        try:
+            checked = datetime.fromisoformat(self.cfg.get("orgs_checked") or "")
+        except (TypeError, ValueError):
+            return True
+        return datetime.now() - checked > timedelta(hours=ORG_LIST_REFRESH_H)
 
     # ── Connect / disconnect ───────────────────────────────────────────────
 
@@ -1363,6 +1723,7 @@ class ClaudeTracker(rumps.App):
             cfg["live_mode"]   = True
             for f in self._IDENTITY_FIELDS:   # re-detect for the freshly connected org
                 cfg[f] = None
+            cfg["orgs"], cfg["orgs_checked"], cfg["org_usage"] = [], None, {}
             save_cfg(cfg)
             self.cfg = cfg
             self._fetch_error = ""
@@ -1396,6 +1757,7 @@ class ClaudeTracker(rumps.App):
         cfg["live_mode"]   = False
         for f in self._IDENTITY_FIELDS:
             cfg[f] = None
+        cfg["orgs"], cfg["orgs_checked"], cfg["org_usage"] = [], None, {}
         save_cfg(cfg)
         self.cfg = cfg
         self._fetch_error = ""
@@ -1614,9 +1976,11 @@ class ClaudeTracker(rumps.App):
                 self.cfg.update({k: v for k, v in ident.items() if v is not None})
                 save_cfg(self.cfg)
 
-        if self._show_history_window(daily_peaks(_read_history())):
+        if self._show_history_window(daily_peaks(self._main_history())):
             return
-        rumps.alert(title="Dashboard", message=format_history_summary(), ok="Close")
+        rumps.alert(title="Dashboard",
+                    message=format_history_summary(self.cfg.get("org_id") or None),
+                    ok="Close")
 
     # ── Background tick ────────────────────────────────────────────────────
 
@@ -1629,6 +1993,7 @@ class ClaudeTracker(rumps.App):
             pct, cd = _pct_and_cd(self.cfg)
             self._set_title(pct, cd)
             self._i_timer.title = f"  ↺  {cd}" if cd else "  ↺  —"
+            self._sync_extra_items()   # removes any per-org icons
 
 
 def _install_edit_menu(app) -> None:

@@ -10,6 +10,7 @@ A lightweight macOS menu bar app that shows your Claude.ai usage at a glance —
 
 - **Live usage** — your real utilization, read straight from Claude.ai (5-hour and 7-day windows)
 - **A slick colour-coded bar** — green → amber → red as you approach your limit
+- **Multiple organizations** — track two Team workspaces side by side, or pick just one
 - **Per-model limits** — separate 7-day Opus and Sonnet usage (handy on Max/Team)
 - **Your plan** — Free, Pro, Max (5×/20×), Team, or Team Premium, detected automatically
 - **Dashboard** — your account, organisation, role, reset times, and a 21-day history chart
@@ -108,9 +109,23 @@ Click the menu bar icon to open the menu:
 | **Last 3 days** | Mini bars of your recent daily peaks |
 | **● Live — Xm ago** | Connection status and last sync time |
 | **Dashboard** | Full account info, plan, reset times, and a 21-day history chart |
+| **Menu Bar** | Only if your account belongs to more than one organization (e.g. two Team workspaces) — pick **Show all organizations** or **Only *&lt;org&gt;*** |
 | **Connect / Reconnect…** | Enter or update your session key |
 | **Disconnect** | Remove your saved key and stop syncing |
 | **Quit** | Close the app (your key stays saved for next time) |
+
+### Several organizations
+
+If your claude.ai account belongs to more than one subscription — for example two
+Team workspaces, or a personal Pro plan plus a Team seat — each has its own limits.
+The app finds them automatically. Under **Menu Bar** you can choose:
+
+- **Show all organizations** — one icon per organization, each labelled with its
+  name (e.g. `Acme  42%  2h 10m`). Click any icon for that organization's details.
+- **Only *&lt;org&gt;*** — a single icon for the organization you pick.
+
+The main icon (and the Dashboard) shows your main organization; use
+**Make this the main icon** in another organization's menu to swap.
 
 > **Tip:** **Quit** just closes the app — it reopens connected next time. **Disconnect** actually removes your saved key, so you'd have to paste it again.
 
